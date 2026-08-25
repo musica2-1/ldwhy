@@ -27,6 +27,8 @@ pub struct ApplicationProfile {
     pub resolved_executable: String,
     pub binary: Option<BinaryInfo>,
     pub dependency_graph: HashMap<String, DependencyNode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<crate::analyzers::permission_analyzer::PermissionAnalysis>,
 }
 
 #[derive(Debug, Serialize, Clone, PartialEq, Eq, Hash)]

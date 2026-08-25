@@ -63,9 +63,12 @@ executável:
 
 **Modo interativo:** rodar `idwhy` sem subcomando (ou `cargo run`) lista os aplicativos
 atualmente em execução (varredura de `/proc/*/exe` via
-`src/core/process_scan.rs`, deduplicada por caminho real) e permite
-selecionar pelo número, escolher "[0] Outro" para digitar um caminho/nome,
-ou simplesmente digitar um caminho/nome direto no prompt. Sem TTY, a
+`src/core/process_scan.rs`, deduplicada por caminho real). Serviços do
+sistema (daemons, infra de desktop) ficam **ocultos por padrão** — a lista
+mostra só apps de usuário — com paginação de 20 em 20 (`Enter` = mostrar
+mais) e atalho `[t]` para exibir/ocultar os serviços. Também dá para
+selecionar pelo número, usar `[0] Outro` para digitar um caminho/nome, ou
+simplesmente digitar um caminho/nome direto no prompt. Sem TTY, a
 ferramenta orienta o uso de `cargo run -- diagnose <alvo>`.
 
 **Limitação atual:** só entende binários ELF diretos. Não detecta scripts
@@ -103,7 +106,7 @@ cache do sistema, não o binário sendo diagnosticado.
 Duas funções:
 - `collect_evidence()`: converte o `ApplicationProfile` em uma lista de
   `Evidence` tipada (hoje: `path_not_found`, `elf_invalid`,
-  `missing_shared_library`, `no_interpreter`).
+  `missing_shared_library`, `no_interpreter`, `exec_permission_denied`).
 - `rank_causes()`: agrupa evidências relacionadas em `CauseCandidate`
   (score derivado da soma dos pesos das evidências — sem pesos
   duplicados em hardcode), calcula uma `confidence` (heurística — ver
@@ -116,6 +119,19 @@ Imprime o relatório em texto formatado (estilo `coreutils`/`strace`) ou
 em JSON (`--json`), no formato inspirado no protótipo original de
 pesquisa.
 
+### 2.6 Permission Check (`src/analyzers/permission_analyzer.rs`)
+Simula a **decisão do kernel** ao tentar executar o arquivo com o usuário
+atual — sem depender da crate `libc` (identidade lida de `/proc/self/status`,
+incluindo grupos suplementares):
+- dono do arquivo → bits de dono;
+- grupo efetivo/suplementar → bits de grupo;
+- demais → bits de other; `root` precisa de qualquer bit x.
+
+Se o usuário atual não pode executar, emite evidência crítica
+`exec_permission_denied` com modo octal e uids envolvidos, e a causa
+`cc_exec_permission` sugere `chmod +x`. Limitação MVP: ACLs estendidas
+(`getfacl`) ainda não são consideradas.
+
 ---
 
 ## 3. O que NÃO está implementado ainda
@@ -125,7 +141,7 @@ arriscado):
 
 | # | Componente | Por que ainda não entrou | Complexidade |
 |---|---|---|---|
-| 1 | **Permission Check** | Fácil: `stat()` no binário + ACL básico | Baixa |
+| ~~1~~ | ~~Permission Check~~ | **Implementado (seção 2.6)** — falta refinar com ACLs estendidas | Baixa |
 | 2 | **Environment Scan** | Fácil: ler `DISPLAY`, `WAYLAND_DISPLAY`, `XDG_*`, comparar com o esperado | Baixa |
 | 3 | **Package ID** | Precisa abstrair `rpm -qf` / `dpkg -S` / `pacman -Qo` por distro | Média |
 | 4 | **File Integrity** | Comparar SHA-256 (já calculado) contra o hash que o gerenciador de pacotes registrou | Média |
@@ -223,7 +239,8 @@ src/
 │   └── process_scan.rs            # Lista aplicações em execução via /proc/*/exe
 ├── analyzers/
 │   ├── static_analyzer.rs         # Parsing ELF (goblin), nunca executa o binário
-│   └── dependency_analyzer.rs     # Grafo de dependências (BFS por objeto + ldconfig)
+│   ├── dependency_analyzer.rs     # Grafo de dependências (BFS por objeto + ldconfig)
+│   └── permission_analyzer.rs     # Simula decisão do kernel sobre execução
 ├── inference/
 │   └── rule_engine.rs             # Evidence -> CauseCandidate, scoring
 └── report/

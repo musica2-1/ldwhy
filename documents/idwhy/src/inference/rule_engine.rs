@@ -21,6 +21,8 @@ const CALIBRATIONS: &[(&str, Calibration)] = &[
     ("target_resolution", Calibration { score_full: 50.0, cap: 0.95 }),
     // Reservado à Etapa 3 (environment): evidências podem ser falso positivo.
     ("environment", Calibration { score_full: 40.0, cap: 0.60 }),
+    // Sem bit x aplicável ao usuário é inequívoco (o próprio kernel negaria).
+    ("permission", Calibration { score_full: 40.0, cap: 0.95 }),
 ];
 
 fn calibration_for(category: &str) -> Option<&'static Calibration> {
@@ -72,6 +74,32 @@ pub fn collect_evidence(profile: &ApplicationProfile) -> Vec<Evidence> {
             data: serde_json::json!({}),
         });
         return evidences; // não faz sentido seguir analisando dependências
+    }
+
+    // Permissão de execução simulada para o usuário atual (Etapa 2).
+    if let Some(perm) = &profile.permissions {
+        if !perm.user_can_execute {
+            evidences.push(Evidence {
+                id: next_id(),
+                source: "permission_analyzer".into(),
+                kind: "exec_permission_denied".into(),
+                severity: Severity::Critical,
+                weight: 40,
+                description: format!(
+                    "Sem permissão de execução para o usuário atual (modo {:03o}, \
+                    dono uid {}, você é uid {})",
+                    perm.mode & 0o777,
+                    perm.file_uid,
+                    perm.euid
+                ),
+                data: serde_json::json!({
+                    "mode": format!("{:03o}", perm.mode & 0o777),
+                    "file_uid": perm.file_uid,
+                    "file_gid": perm.file_gid,
+                    "euid": perm.euid,
+                }),
+            });
+        }
     }
 
     // Interpretador ausente (ld.so) -> binário não vai nem iniciar
@@ -211,6 +239,30 @@ pub fn rank_causes(profile: &ApplicationProfile, evidences: &[Evidence]) -> Vec<
         });
     }
 
+    let exec_denied_evs: Vec<&Evidence> = evidences
+        .iter()
+        .filter(|e| e.kind == "exec_permission_denied")
+        .collect();
+    if !exec_denied_evs.is_empty() {
+        let score: f64 = exec_denied_evs.iter().map(|e| e.weight as f64).sum();
+        let alvo = &profile.resolved_executable;
+        candidates.push(CauseCandidate {
+            cause_id: "cc_exec_permission".into(),
+            description: "Permissão de execução negada para o usuário atual".into(),
+            category: "permission".into(),
+            evidence_ids: exec_denied_evs.iter().map(|e| e.id.clone()).collect(),
+            score,
+            confidence: calibrated_confidence("permission", score),
+            suggested_fix: Some(Remediation {
+                description: "Conceder permissão de execução ao arquivo".into(),
+                investigation_command: Some(format!("ls -l {alvo}")),
+                suggested_command: Some(format!("chmod +x {alvo}")),
+                risk: "low".into(),
+                automated_safe: false,
+            }),
+        });
+    }
+
     // Sem nenhuma evidência crítica -> nada encontrado nesta camada estática
     if candidates.is_empty() {
         candidates.push(CauseCandidate {
@@ -266,6 +318,7 @@ mod tests {
                 sha256: "0".repeat(64),
             }),
             dependency_graph: HashMap::new(),
+            permissions: None,
         }
     }
 
@@ -317,5 +370,56 @@ mod tests {
         let causes = rank_causes(&profile, &[]);
         assert_eq!(causes[0].cause_id, "cc_no_static_issue");
         assert_eq!(causes[0].confidence, 0.0);
+    }
+
+    #[test]
+    fn exec_permission_denied_gera_causa_com_chmod() {
+        let mut profile = empty_profile();
+        profile.permissions = Some(crate::analyzers::permission_analyzer::PermissionAnalysis {
+            mode: 0o100644,
+            file_uid: 1000,
+            file_gid: 1000,
+            euid: 1000,
+            egid: 1000,
+            user_can_execute: false,
+        });
+
+        let evidences = collect_evidence(&profile);
+        assert!(
+            evidences.iter().any(|e| e.kind == "exec_permission_denied"),
+            "collect_evidence deve emitir a evidência: {:?}",
+            evidences
+        );
+
+        let causes = rank_causes(&profile, &evidences);
+        let cc = causes
+            .iter()
+            .find(|c| c.cause_id == "cc_exec_permission")
+            .expect("causa de permissão deve ser candidata");
+
+        assert!((cc.confidence - 0.95).abs() < 1e-9);
+        let fix = cc.suggested_fix.as_ref().unwrap();
+        assert_eq!(
+            fix.suggested_command.as_deref(),
+            Some("chmod +x /tmp/app")
+        );
+    }
+
+    #[test]
+    fn permissao_ok_nao_gera_evidencia() {
+        let mut profile = empty_profile();
+        profile.permissions = Some(crate::analyzers::permission_analyzer::PermissionAnalysis {
+            mode: 0o100755,
+            file_uid: 1000,
+            file_gid: 1000,
+            euid: 1000,
+            egid: 1000,
+            user_can_execute: true,
+        });
+        let evidences = collect_evidence(&profile);
+        assert!(
+            !evidences.iter().any(|e| e.kind == "exec_permission_denied"),
+            "perfil com execução permitida não deve alertar"
+        );
     }
 }

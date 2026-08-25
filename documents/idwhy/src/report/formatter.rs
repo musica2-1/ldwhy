@@ -22,8 +22,12 @@ pub fn print_report(report: &DiagnosticReport) {
             println!("  Arquitetura: {}", b.arch);
             println!("  SHA-256: {}", &b.sha256[..16]);
             match &b.interpreter {
-                Some(i) => println!("  Interpretador: {i}"),
+                Some(i) =>             println!("  Interpretador: {i}"),
                 None => println!("  Interpretador: (nenhum — binário estático)"),
+            }
+
+            if let Some(p) = &report.profile.permissions {
+                println!("  Permissões:   {p}");
             }
 
             if !b.needed.is_empty() {

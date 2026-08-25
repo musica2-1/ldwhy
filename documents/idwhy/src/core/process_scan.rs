@@ -78,6 +78,38 @@ fn exe_name_fallback(path: &Path) -> String {
         .unwrap_or_default()
 }
 
+const SYSTEM_PATH_PREFIXES: &[&str] = &[
+    "/usr/libexec/", "/usr/lib/", "/usr/lib64/", "/lib/", "/lib64/",
+    "/usr/sbin/", "/sbin/", "/usr/lib/x86_64-linux-gnu/",
+];
+
+/// Palavras que identificam daemons/serviços mesmo quando o binário mora
+/// em /usr/bin (ex: akonadiserver, baloo_file). Lista curada, não exaustiva:
+/// falso negativo só custa uma linha a mais no menu; falso positivo esconde
+/// um app real — por isso o toggle 't' existe.
+const SYSTEM_NAME_HINTS: &[&str] = &[
+    "systemd", "dbus", "gvfs", "xdg-", "at-spi", "pipewire", "wireplumber",
+    "pulseaudio", "polkit", "rtkit", "colord", "upower", "udisks", "accounts-daemon",
+    "packagekit", "switcheroo", "-portal", "portal-", "gnome-shell", "gsd-",
+    "ibus", "kded", "klauncher", "akonadi", "baloo", "kactivitymanagerd",
+    "kglobalaccel", "kscreen", "kwalletd", "kwin", "plasma", "drkonqi",
+    "xorg", "xsettingsd", "xembedsniproxy", "sshd", "cupsd", "snapd",
+    "systemsettings", "kio", "dconf-service", "gnome-keyring", "gcr-",
+    "seahorse", "tracker", "goa-daemon", "gvfsd", "at-spi2",
+];
+
+/// Heurística: provável serviço de sistema/plano de fundo, não um app
+/// que o usuário tentaria diagnosticar. Nunca bloqueia — só filtra a
+/// visão padrão do modo interativo.
+pub fn is_likely_system_service(app: &RunningApp) -> bool {
+    let path = app.exe_path.to_string_lossy();
+    if SYSTEM_PATH_PREFIXES.iter().any(|p| path.starts_with(p)) {
+        return true;
+    }
+    let comm = app.comm.to_lowercase();
+    SYSTEM_NAME_HINTS.iter().any(|hint| comm.contains(hint))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,5 +150,32 @@ mod tests {
             normalize_proc_link(Path::new("/usr/bin/app")),
             PathBuf::from("/usr/bin/app")
         );
+    }
+
+    fn app_at(path: &str, comm: &str) -> RunningApp {
+        RunningApp { pid: 1, comm: comm.into(), exe_path: PathBuf::from(path) }
+    }
+
+    #[test]
+    fn classifica_daemons_por_caminho_e_nome() {
+        assert!(is_likely_system_service(&app_at(
+            "/usr/libexec/at-spi-bus-launcher", "at-spi-bus-laun")));
+        assert!(is_likely_system_service(&app_at(
+            "/usr/lib/systemd/systemd-resolved", "systemd-resolve")));
+        assert!(is_likely_system_service(&app_at(
+            "/usr/bin/akonadiserver", "akonadiserver")));
+        assert!(is_likely_system_service(&app_at(
+            "/usr/bin/dconf-service", "dconf-service")));
+    }
+
+    #[test]
+    fn nao_classifica_apps_de_usuario_como_servico() {
+        assert!(!is_likely_system_service(&app_at("/usr/bin/bash", "bash")));
+        assert!(!is_likely_system_service(&app_at("/usr/bin/anydesk", "anydesk")));
+        assert!(!is_likely_system_service(&app_at(
+            "/home/lucas/projetos/app/target/debug/meuapp", "meuapp")));
+        // App em /opt e flatpak também passam.
+        assert!(!is_likely_system_service(&app_at(
+            "/var/lib/flatpak/app/org.mozilla.firefox/x86_64/stable/.../firefox", "firefox")));
     }
 }

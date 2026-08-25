@@ -49,7 +49,7 @@ fn main() -> anyhow::Result<()> {
 fn run_diagnosis(target: &str) -> anyhow::Result<DiagnosticReport> {
     let resolved = core::discovery::resolve_executable(target);
 
-    let (resolved_executable, binary, dependency_graph) = match resolved {
+    let (resolved_executable, binary, dependency_graph, permissions) = match resolved {
         Ok(path) => {
             let binary = analyzers::static_analyzer::analyze_binary(&path).ok();
 
@@ -60,9 +60,17 @@ fn run_diagnosis(target: &str) -> anyhow::Result<DiagnosticReport> {
                 _ => Default::default(),
             };
 
-            (path.to_string_lossy().to_string(), binary, dependency_graph)
+            let permissions =
+                analyzers::permission_analyzer::analyze_permissions(&path);
+
+            (
+                path.to_string_lossy().to_string(),
+                binary,
+                dependency_graph,
+                permissions,
+            )
         }
-        Err(_) => (target.to_string(), None, Default::default()),
+        Err(_) => (target.to_string(), None, Default::default(), None),
     };
 
     let profile = ApplicationProfile {
@@ -70,6 +78,7 @@ fn run_diagnosis(target: &str) -> anyhow::Result<DiagnosticReport> {
         resolved_executable,
         binary,
         dependency_graph,
+        permissions,
     };
 
     let evidences = inference::rule_engine::collect_evidence(&profile);
@@ -92,66 +101,133 @@ fn run_and_print(target: &str, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Modo interativo: lista os aplicativos em execução e permite escolher
-/// pelo número, escolher a opção manual, ou digitar um caminho/nome direto.
+/// Modo interativo: lista os aplicativos em execução (serviços de sistema
+/// ocultos por padrão) com paginação, e permite escolher pelo número,
+/// digitar um caminho/nome direto, ou usar a opção manual.
+const PAGE_SIZE: usize = 20;
+
 fn select_target_interactively() -> anyhow::Result<String> {
     if !io::stdin().is_terminal() {
         anyhow::bail!(
-            "O modo interativo precisa de um terminal. Use: diag diagnose <alvo>"
+            "O modo interativo precisa de um terminal. Use: cargo run -- diagnose <alvo>"
         );
     }
 
-    let apps = core::process_scan::list_running_apps(std::env::current_exe().ok().as_deref());
+    let all_apps = core::process_scan::list_running_apps(std::env::current_exe().ok().as_deref());
+    let total = all_apps.len();
 
     println!("{DLINE}");
     println!("  Diagnóstico interativo");
     println!("{DLINE}\n");
 
-    if !apps.is_empty() {
-        println!("  Aplicações em execução:\n");
-        for (idx, app) in apps.iter().enumerate() {
-            println!(
-                "   [{:>2}] {:<28} {}",
-                idx + 1,
-                truncate(&app.comm, 26),
-                app.exe_path.display()
-            );
-        }
-    } else {
-        println!("  Nenhum aplicativo em execução detectado.\n");
+    if all_apps.is_empty() {
+        return prompt_manual_target("  Nenhum aplicativo em execução detectado.\n\n  Caminho do executável ou nome do comando: ");
     }
-    println!("   [ 0] Outro — informar caminho ou nome manualmente\n");
 
+    let mut include_system = false;
     loop {
-        print!("  Selecione o número da aplicação ou digite um caminho/nome: ");
-        io::stdout().flush()?;
+        let pool: Vec<&core::process_scan::RunningApp> = all_apps
+            .iter()
+            .filter(|a| include_system || !core::process_scan::is_likely_system_service(a))
+            .collect();
+        let ocultos = total - pool.len();
 
-        let choice = read_line_trimmed()?;
-        if choice.is_empty() {
-            continue;
-        }
+        println!(
+            "  Aplicações em execução ({} de {} processos{}):",
+            pool.len(),
+            total,
+            if ocultos > 0 {
+                format!("; {ocultos} serviços do sistema ocultos")
+            } else {
+                String::new()
+            }
+        );
+        println!();
 
-        match choice.parse::<usize>() {
-            Ok(0) => {
-                loop {
-                    print!("  Caminho do executável ou nome do comando: ");
-                    io::stdout().flush()?;
-                    let manual = read_line_trimmed()?;
-                    if !manual.is_empty() {
-                        return Ok(manual);
-                    }
+        let mut shown = 0usize;
+        loop {
+            let end = (shown + PAGE_SIZE).min(pool.len());
+            for (i, app) in pool[shown..end].iter().enumerate() {
+                println!(
+                    "   [{:>2}] {:<28} {}",
+                    shown + i + 1,
+                    truncate(&app.comm, 26),
+                    app.exe_path.display()
+                );
+            }
+            shown = end;
+
+            println!("   [ 0] Outro — informar caminho ou nome manualmente");
+            match (include_system, ocultos) {
+                (false, n) if n > 0 => println!("   [ t] Mostrar também os {n} serviços do sistema"),
+                (true, _) => println!("   [ t] Ocultar serviços do sistema"),
+                _ => {}
+            }
+            println!();
+
+            print!("  Selecione o número ou digite um caminho/nome");
+            if shown < pool.len() {
+                print!(" (Enter = mostrar mais)");
+            }
+            print!(": ");
+            io::stdout().flush()?;
+
+            match handle_menu_input(&pool, &mut shown)? {
+                MenuOutcome::Target(t) => return Ok(t),
+                MenuOutcome::ToggleSystem => {
+                    include_system = !include_system;
+                    break;
                 }
+                MenuOutcome::Reprompt => {}
             }
-            Ok(n) if n >= 1 && n <= apps.len() => {
-                return Ok(apps[n - 1].exe_path.to_string_lossy().into_owned());
-            }
-            Ok(_) => {
-                println!("  Número fora da lista (1–{}). Tente novamente.", apps.len());
-            }
-            Err(_) => {
-                // Não é número: trata como alvo direto (ex: "vim" ou "/usr/bin/vim").
-                return Ok(choice);
-            }
+        }
+    }
+}
+
+enum MenuOutcome {
+    Target(String),
+    ToggleSystem,
+    Reprompt,
+}
+
+fn handle_menu_input(
+    pool: &[&core::process_scan::RunningApp],
+    shown: &mut usize,
+) -> anyhow::Result<MenuOutcome> {
+    let choice = read_line_trimmed()?;
+
+    if choice.is_empty() {
+        if *shown >= pool.len() {
+            println!("  Toda a lista já está visível.");
+        }
+        return Ok(MenuOutcome::Reprompt);
+    }
+
+    if choice.eq_ignore_ascii_case("t") {
+        return Ok(MenuOutcome::ToggleSystem);
+    }
+
+    match choice.parse::<usize>() {
+        Ok(0) => prompt_manual_target("  Caminho do executável ou nome do comando: ")
+            .map(MenuOutcome::Target),
+        Ok(n) if n >= 1 && n <= pool.len() => {
+            Ok(MenuOutcome::Target(pool[n - 1].exe_path.to_string_lossy().into_owned()))
+        }
+        Ok(_) => {
+            println!("  Número fora da lista (1–{}). Tente novamente.", pool.len());
+            Ok(MenuOutcome::Reprompt)
+        }
+        Err(_) => Ok(MenuOutcome::Target(choice)),
+    }
+}
+
+fn prompt_manual_target(prompt: &str) -> anyhow::Result<String> {
+    loop {
+        print!("{prompt}");
+        io::stdout().flush()?;
+        let manual = read_line_trimmed()?;
+        if !manual.is_empty() {
+            return Ok(manual);
         }
     }
 }

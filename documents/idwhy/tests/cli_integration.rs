@@ -66,6 +66,41 @@ fn modo_interativo_sem_tty_falha_com_dica() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("diagnose"),
-        "mensagem deve sugerir `diag diagnose <alvo>`; veio: {stderr}"
+        "mensagem deve sugerir `diagnose`; veio: {stderr}"
     );
+}
+
+#[test]
+fn binario_sem_bit_de_execucao_gera_evidencia_e_causa() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir().join(format!("idwhy_perm_test_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let alvo = dir.join("app_sem_x");
+    std::fs::copy("/bin/true", &alvo).unwrap();
+    std::fs::set_permissions(&alvo, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let (code, stdout, _stderr) =
+        run_diag(&["diagnose", "--json", alvo.to_string_lossy().as_ref()]);
+    assert_eq!(code, 0);
+
+    let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(
+        value["evidences"][0]["kind"].as_str(),
+        Some("exec_permission_denied"),
+        "evidência de permissão deve existir; veio: {stdout}"
+    );
+    assert_eq!(value["evidences"][0]["data"]["mode"].as_str(), Some("644"));
+
+    let causes = value["candidates"].as_array().unwrap();
+    assert!(
+        causes.iter().any(|c| c["cause_id"] == "cc_exec_permission"),
+        "causa cc_exec_permission deve ser candidata: {stdout}"
+    );
+
+    let (_code, text_out, _stderr) = run_diag(&["diagnose", alvo.to_string_lossy().as_ref()]);
+    assert!(text_out.contains("chmod +x"), "remediação chmod +x esperada:\n{text_out}");
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
