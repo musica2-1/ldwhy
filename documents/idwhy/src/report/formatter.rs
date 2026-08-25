@@ -5,7 +5,7 @@ const DLINE: &str = "═══════════════════�
 
 pub fn print_report(report: &DiagnosticReport) {
     println!("{DLINE}");
-    println!("  Linux Application Diagnostic Tool (MVP static core)");
+    println!("  idwhy — Linux Application Diagnostic");
     println!("{DLINE}\n");
 
     println!("Input:       {}", report.profile.input_path);
@@ -59,7 +59,7 @@ pub fn print_report(report: &DiagnosticReport) {
     if let Some(top) = report.candidates.first() {
         println!("  Most Probable Cause: {}", top.description);
         println!("  Confidence: {:.0}%", top.confidence * 100.0);
-        println!("  Score: {:.1} (evidências não calibradas — heurística de MVP)", top.score);
+        println!("  Score: {:.1} (soma dos pesos das evidências; confiança com teto por categoria)", top.score);
 
         if !top.evidence_ids.is_empty() {
             println!("\n  Evidence:");

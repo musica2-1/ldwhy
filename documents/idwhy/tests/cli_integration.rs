@@ -1,6 +1,6 @@
 use std::process::Command;
 
-const BIN: &str = env!("CARGO_BIN_EXE_linux-app-diagnostic");
+const BIN: &str = env!("CARGO_BIN_EXE_idwhy");
 
 fn run_diag(args: &[&str]) -> (i32, String, String) {
     let out = Command::new(BIN).args(args).output().expect("binário de teste deve executar");

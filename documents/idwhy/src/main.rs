@@ -11,7 +11,7 @@ use crate::core::types::{ApplicationProfile, DiagnosticReport};
 const DLINE: &str = "═══════════════════════════════════════════════════════";
 
 #[derive(Parser)]
-#[command(name = "diag", version, about = "Motor de diagnóstico de aplicações Linux (núcleo estático do MVP)")]
+#[command(name = "idwhy", version, about = "idwhy — diagnóstico causal de aplicações Linux (causa raiz ranqueada + confiança)")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,

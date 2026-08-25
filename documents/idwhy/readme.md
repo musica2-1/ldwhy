@@ -1,9 +1,9 @@
-# Linux Application Diagnostic Tool
+# idwhy
 
-Motor de diagnóstico causal para aplicações Linux. Em vez de despejar logs
-brutos (como `strace` ou `journalctl` fazem), a ferramenta correlaciona
-evidências de múltiplas camadas do sistema e produz um diagnóstico com
-**causa raiz ranqueada + nível de confiança**.
+*Linux Application Diagnostic* — motor de diagnóstico causal para aplicações
+Linux. Em vez de despejar logs brutos (como `strace` ou `journalctl` fazem),
+a ferramenta correlaciona evidências de múltiplas camadas do sistema e
+produz um diagnóstico com **causa raiz ranqueada + nível de confiança**.
 
 Este README documenta a lógica de funcionamento do que já está implementado
 e o que falta para chegar ao MVP completo.
@@ -61,12 +61,12 @@ executável:
   bit de execução (mesma semântica do shell).
 - Segue symlinks via `canonicalize()`.
 
-**Modo interativo:** rodar `diag` sem subcomando lista os aplicativos
+**Modo interativo:** rodar `idwhy` sem subcomando (ou `cargo run`) lista os aplicativos
 atualmente em execução (varredura de `/proc/*/exe` via
 `src/core/process_scan.rs`, deduplicada por caminho real) e permite
 selecionar pelo número, escolher "[0] Outro" para digitar um caminho/nome,
 ou simplesmente digitar um caminho/nome direto no prompt. Sem TTY, a
-ferramenta orienta o uso de `diag diagnose <alvo>`.
+ferramenta orienta o uso de `cargo run -- diagnose <alvo>`.
 
 **Limitação atual:** só entende binários ELF diretos. Não detecta scripts
 (shebang `#!/bin/bash`), nem resolve o executável real por trás de
@@ -140,28 +140,33 @@ arriscado):
 
 ---
 
-## 4. Ponto em aberto: a fórmula de confiança
+## 4. Fórmula de confiança (decidida)
 
-A fórmula atual (`score / 100.0`, limitada a 0.97) é **arbitrária**, não
-calibrada. No teste real que fizemos (lib ausente, uma única evidência,
-peso 45), a confiança saiu em **45%** — bem abaixo do que a tabela de
-testes original previa (>90%).
+A fórmula antiga (`score / 100.0`, limitada a 0.97) era arbitrária: no teste
+real (lib ausente, evidência única de peso 45), a confiança saía em **45%**,
+bem abaixo do esperado para algo praticamente inequívoco.
 
-Duas correções possíveis, não mutuamente exclusivas:
-1. **Recalibrar o score_maximo por categoria de causa** — "dependência
-   ausente" com uma única evidência forte deveria valer mais que 45%,
-   já que é uma evidência praticamente inequívoca (não há ambiguidade:
-   ou a lib existe no disco ou não existe).
-2. **Não fingir confiança percentual até haver dados reais.** Uma
-   alternativa mais honesta para o MVP seria reportar apenas
-   `severity` (baixa/média/alta/crítica) e reservar "confiança
-   calibrada em %" para depois que houver histórico de acerto/erro
-   real (como a própria seção H do documento de pesquisa original já
-   reconhecia, mas contradizia ao cravar números na tabela de testes).
+**Decisão adotada (Etapa 1):** calibração por categoria de causa, em
+`src/inference/rule_engine.rs`:
 
-**Recomendação:** decidir isso antes de escrever mais regras — cada
-regra nova que entra vai carregar a mesma ambiguidade se o critério não
-for fixado agora.
+```text
+confidence = min(score / score_full, 1.0) × cap
+```
+
+| Categoria | `score_full` | `cap` | Racional |
+|---|---|---|---|
+| `dependency` | 45 | 0.95 | Uma única lib ausente já é conclusiva (existe no disco ou não) |
+| `binary_integrity` | 60 | 0.95 | Header ELF inválido não tem interpretação alternativa |
+| `target_resolution` | 50 | 0.95 | Alvo inexistente é fato, não hipótese |
+| `environment` | 40 | **0.60** | Reservado à Etapa 3: evidência de ambiente pode ser falso positivo |
+
+Efeito: uma lib ausente agora reporta **95%** de confiança; categorias
+ambíguas mantêm gradiente (uma evidência fraca ≠ certeza) e nunca passam do
+cap da própria categoria. Categoria desconhecida → 0.0 (falha segura).
+
+A calibração estatística com dados reais de acerto/erro (histórico de uso)
+continua como meta futura — o cap por categoria é o modelo honesto possível
+enquanto esse histórico não existe.
 
 ---
 

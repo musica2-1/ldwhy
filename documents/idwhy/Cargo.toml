@@ -1,7 +1,9 @@
 [package]
-name = "linux-app-diagnostic"
+name = "idwhy"
 version = "0.1.0"
 edition = "2021"
+description = "Motor de diagnóstico causal para aplicações Linux: causa raiz ranqueada com nível de confiança"
+license = "MIT"
 
 [dependencies]
 anyhow = "1.0.104"
