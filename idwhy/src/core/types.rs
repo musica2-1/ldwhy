@@ -22,17 +22,37 @@ pub struct BinaryInfo {
 }
 
 #[derive(Debug, Serialize, Clone)]
+pub struct WrapperStep {
+    /// "script_shebang" | "appimage" | "flatpak"
+    pub kind: String,
+    pub detail: String,
+    /// Caminho resolvido no próximo salto.
+    pub points_to: String,
+    /// Problema encontrado neste wrapper (shebang quebrado etc.).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issue: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
 pub struct ApplicationProfile {
     pub input_path: String,
     pub resolved_executable: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub wrapper_chain: Vec<crate::core::types::WrapperStep>,
     pub binary: Option<BinaryInfo>,
     pub dependency_graph: HashMap<String, DependencyNode>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub permissions: Option<crate::analyzers::permission_analyzer::PermissionAnalysis>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub environment: Option<crate::analyzers::environment_analyzer::EnvironmentAnalysis>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub package_owner: Option<crate::analyzers::package_analyzer::PackageInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub integrity: Option<crate::analyzers::package_analyzer::IntegrityCheck>,
 }
 
 #[derive(Debug, Serialize, Clone, PartialEq, Eq, Hash)]
-#[allow(dead_code)] // Info/Error entram quando adicionarmos permission_check e runtime_analyzer
+#[allow(dead_code)] // Error entra com o runtime_analyzer (strace controlado)
 pub enum Severity {
     Info,
     Warning,

@@ -71,9 +71,20 @@ selecionar pelo número, usar `[0] Outro` para digitar um caminho/nome, ou
 simplesmente digitar um caminho/nome direto no prompt. Sem TTY, a
 ferramenta orienta o uso de `cargo run -- diagnose <alvo>`.
 
-**Limitação atual:** só entende binários ELF diretos. Não detecta scripts
-(shebang `#!/bin/bash`), nem resolve o executável real por trás de
-wrappers como `flatpak run` ou AppImage.
+**Wrapper detection (Etapa 6):** `resolve_target()` atravessa wrappers
+até o binário real, com profundidade máx. 5 e guard contra loops:
+- **Shebang**: segue o mesmo interpretador que o kernel executaria
+  (regras do kernel: argumento único; buffer de 256 bytes). Scripts de
+  export do Flatpak caem aqui naturalmente e são rotulados `flatpak`.
+- **`#!/usr/bin/env X`**: resolve X pelo `$PATH`, como o env faz.
+- **AppImage**: mágica `AI\x01/AI\x02` no offset 8; a análise para nele
+  (o payload dentro do squashfs só existe montado/executando).
+- **Shebang quebrado vira diagnóstico**: CRLF na linha (`#!bin/sh\r`) e
+  interpretador sem caminho absoluto geram evidência crítica
+  `broken_wrapper` + causa `cc_broken_wrapper` com correção concreta.
+
+Limitação atual: não desmonta AppImage/squashfs; não rastreia wrappers
+que exigem execução (ex.: `flatpak run` como comando, fora de script).
 
 ### 2.2 Static Analyzer (`src/analyzers/static_analyzer.rs`)
 Usa a crate `goblin` para ler o ELF **sem nunca executar o binário**:
@@ -106,7 +117,8 @@ cache do sistema, não o binário sendo diagnosticado.
 Duas funções:
 - `collect_evidence()`: converte o `ApplicationProfile` em uma lista de
   `Evidence` tipada (hoje: `path_not_found`, `elf_invalid`,
-  `missing_shared_library`, `no_interpreter`, `exec_permission_denied`).
+  `missing_shared_library`, `no_interpreter`, `exec_permission_denied`,
+  `missing_display_env`, `ld_preload_active`, `ld_library_path_active`).
 - `rank_causes()`: agrupa evidências relacionadas em `CauseCandidate`
   (score derivado da soma dos pesos das evidências — sem pesos
   duplicados em hardcode), calcula uma `confidence` (heurística — ver
@@ -132,6 +144,55 @@ Se o usuário atual não pode executar, emite evidência crítica
 `cc_exec_permission` sugere `chmod +x`. Limitação MVP: ACLs estendidas
 (`getfacl`) ainda não são consideradas.
 
+### 2.7 Environment Scan (`src/analyzers/environment_analyzer.rs`)
+Lê o ambiente **do processo diag** (herdado do shell do usuário) e o cruza
+com a análise estática:
+
+- **Correlação gráfica**: identifica libs gráficas no NEEDED/grafo
+  (`libX11`, `libxcb`, `libwayland`, `libgtk*`, `libQt5/6`, `libSDL2`,
+  `libEGL`/`libGL`). **Só um app gráfico sem `DISPLAY` nem
+  `WAYLAND_DISPLAY` gera evidência** (`missing_display_env`) — apps de
+  terminal não podem gerar falso positivo.
+- **Variáveis LD_***: `LD_PRELOAD` ativo ou `LD_LIBRARY_PATH` definido
+  geram evidências informativas (podem sombrear/mascarar bibliotecas) e
+  uma causa única `cc_suspicious_ld_env` sugerindo re-teste com
+  `env -u`.
+
+Limitação MVP documentada: serviços iniciados pelo systemd têm ambiente
+diferente do interativo; ler `/proc/<pid>/environ` do alvo é evolução
+natural quando o modo interativo passar o PID.
+
+### 2.8 Package ID (`src/analyzers/package_analyzer.rs`)
+Detecta o gerenciador de pacotes via `/etc/os-release` (`ID`/`ID_LIKE`;
+fedora/rhel/suse → dnf/rpm, debian/ubuntu/mint/pop → apt/dpkg) e consulta:
+
+- **Dono de arquivo presente**: `rpm -qf --queryformat` ou `dpkg -S` →
+  alimenta a linha `Pacote:` do relatório e habilita reinstalação concreta
+  quando o ELF está inválido.
+- **Fornecedor de lib ausente**: `dnf -q --cacheonly provides` (somente
+  cache local, **sem rede**) ou `dpkg -S`. Quando encontra, a remediação
+  vira comando direto — ex.: `sudo dnf install vim-enhanced-2:9.2...`.
+  Sem preferência de arquitetura o dnf costuma casar i686 primeiro; por
+  isso a consulta prioriza o candidato com o mesmo arch do binário.
+
+Limitações MVP: sem timeouts nos subprocessos (comandos locais rápidos);
+pacman não implementado; `apt-file` não é requisitado (não é padrão).
+
+### 2.9 File Integrity (`package_analyzer::verify_integrity`)
+Compara o SHA-256 já calculado na análise estática com o hash registrado
+pelo gerenciador na instalação:
+
+- **RPM**: dump `FILENAMES|FILEDIGESTS` do pacote dono; digest de 64 hex é
+  tratado como sha256 e comparado case-insensitive.
+- **Debian**: `/var/lib/dpkg/info/<pkg>.md5sums` registra MD5 — o hash
+  local é obtido com `md5sum` (comando fixo somente leitura).
+
+Semântica honesta em três estados no JSON (`integrity.matches`):
+`true` confere · `false` **MODIFICADO** → evidência `Error`
+`binary_modified_from_package` + causa `cc_binary_tampered` sugerindo
+reinstalação concreta · `null` não comparável (algoritmo diferente, ex:
+rpm legado com md5) — **nunca vira alerta**.
+
 ---
 
 ## 3. O que NÃO está implementado ainda
@@ -142,10 +203,10 @@ arriscado):
 | # | Componente | Por que ainda não entrou | Complexidade |
 |---|---|---|---|
 | ~~1~~ | ~~Permission Check~~ | **Implementado (seção 2.6)** — falta refinar com ACLs estendidas | Baixa |
-| 2 | **Environment Scan** | Fácil: ler `DISPLAY`, `WAYLAND_DISPLAY`, `XDG_*`, comparar com o esperado | Baixa |
-| 3 | **Package ID** | Precisa abstrair `rpm -qf` / `dpkg -S` / `pacman -Qo` por distro | Média |
-| 4 | **File Integrity** | Comparar SHA-256 (já calculado) contra o hash que o gerenciador de pacotes registrou | Média |
-| 5 | **Script/wrapper detection** | Ler shebang, detectar `flatpak run`, resolver o binário real por trás | Média |
+| ~~2~~ | ~~Environment Scan~~ | **Implementado (seção 2.7)** — falta ler `/proc/<pid>/environ` do alvo | Baixa |
+| ~~3~~ | ~~Package ID~~ | **Implementado (seção 2.8)** — dnf/rpm e apt/dpkg; pacman ficou para depois | Média |
+| ~~4~~ | ~~File Integrity~~ | **Implementado (seção 2.9)** — rpm via FILEDIGESTS; debian via md5sums+md5sum | Média |
+| ~~5~~ | ~~Script/wrapper detection~~ | **Implementado (seção 2.1)** — shebang/env/AppImage; AppImage para no wrapper (payload só existe montado) | Média |
 | 6 | **Controlled Execution (strace)** | Executar o app com `strace` filtrado dentro de sandbox (`bubblewrap`) e capturar exit code + syscalls com erro | Alta — mexe com execução real, precisa do modelo de segurança da seção J |
 | 7 | **Log Collection (journalctl)** | Buscar logs por PID/tempo depois da execução controlada | Alta (depende do item 6 para ter PID/tempo) |
 | 8 | **Evidence Correlation temporal/espacial** | Algoritmo de agrupamento por janela de tempo — só faz sentido quando existir mais de uma fonte com timestamp (strace + journal + coredump) | Alta |
@@ -190,8 +251,10 @@ enquanto esse histórico não existe.
 
 Já implementado:
 - Nunca executa o binário sendo diagnosticado (só lê ELF com `goblin`).
-- `ldconfig -p` é a única chamada externa, e é somente leitura do cache
-  do sistema.
+- Chamadas externas são somente leitura e fixas (nunca montadas por
+  concatenação): `ldconfig -p`, `rpm -qf`, `dpkg -S` e
+  `dnf --cacheonly provides` e `md5sum <arquivo>` (sem acesso à rede;
+todos com argumentos fixos, nunca concatenação).
 
 Falta implementar antes de adicionar `strace`/execução controlada
 (componente 6 da tabela acima):
@@ -240,7 +303,9 @@ src/
 ├── analyzers/
 │   ├── static_analyzer.rs         # Parsing ELF (goblin), nunca executa o binário
 │   ├── dependency_analyzer.rs     # Grafo de dependências (BFS por objeto + ldconfig)
-│   └── permission_analyzer.rs     # Simula decisão do kernel sobre execução
+│   ├── permission_analyzer.rs     # Simula decisão do kernel sobre execução
+│   ├── environment_analyzer.rs    # Display/LD_* correlacionado com libs gráficas
+│   └── package_analyzer.rs        # Dono/fornecedor de arquivos via rpm/dpkg/dnf
 ├── inference/
 │   └── rule_engine.rs             # Evidence -> CauseCandidate, scoring
 └── report/

@@ -11,6 +11,17 @@ pub fn print_report(report: &DiagnosticReport) {
     println!("Input:       {}", report.profile.input_path);
     println!("Executable:  {}", report.profile.resolved_executable);
 
+    for (i, step) in report.profile.wrapper_chain.iter().enumerate() {
+        let prefix = if i == 0 { "Wrapper:     " } else { "             " };
+        println!(
+            "{prefix}[{i}] {} {} → {}",
+            step.kind, step.detail, step.points_to
+        );
+        if let Some(issue) = &step.issue {
+            println!("             ⚠ {issue}");
+        }
+    }
+
     println!("\n{LINE}");
     println!("STATIC ANALYSIS");
     println!("{LINE}");
@@ -28,6 +39,39 @@ pub fn print_report(report: &DiagnosticReport) {
 
             if let Some(p) = &report.profile.permissions {
                 println!("  Permissões:   {p}");
+            }
+
+            if let Some(pkg) = &report.profile.package_owner {
+                println!("  Pacote:       {} ({})", pkg.name, pkg.manager);
+            }
+
+            if let Some(check) = &report.profile.integrity {
+                let status = match check.matches {
+                    Some(true) => "✓ confere com o registro do gerenciador".to_string(),
+                    Some(false) => "✗ DIFERE do registrado pelo gerenciador".to_string(),
+                    None => "(não comparável — algoritmo diferente)".to_string(),
+                };
+                println!("  Integridade:  {} [{status}]", check.algo);
+            }
+
+            if let Some(env) = &report.profile.environment {
+                let mut parts = Vec::new();
+                if env.is_graphical() {
+                    parts.push(format!(
+                        "gráfica ({})",
+                        crate::analyzers::environment_analyzer::summarize_libraries(&env.gui_libraries, 3)
+                    ));
+                }
+                match (env.display_set, env.wayland_set) {
+                    (true, true) => parts.push("DISPLAY + Wayland".into()),
+                    (true, false) => parts.push("DISPLAY ativo".into()),
+                    (false, true) => parts.push("Wayland ativo".into()),
+                    (false, false) => parts.push("sem display".into()),
+                }
+                if env.ld_preload.is_some() || !env.ld_library_path.is_empty() {
+                    parts.push("LD_* personalizados ativos".into());
+                }
+                println!("  Ambiente:     {}", parts.join(" · "));
             }
 
             if !b.needed.is_empty() {

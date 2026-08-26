@@ -12,6 +12,67 @@ fn run_diag(args: &[&str]) -> (i32, String, String) {
 }
 
 #[test]
+fn script_com_shebang_crlf_gera_evidencia_de_wrapper_quebrado() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir().join(format!("idwhy_crlf_test_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let alvo = dir.join("quebrado.sh");
+    std::fs::write(&alvo, b"#!/bin/sh\r\necho oi\r\n").unwrap();
+    std::fs::set_permissions(&alvo, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let (_code, json_out, _stderr) =
+        run_diag(&["diagnose", "--json", alvo.to_string_lossy().as_ref()]);
+    let value: serde_json::Value = serde_json::from_str(&json_out).unwrap();
+
+    assert!(
+        value["evidences"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["kind"] == "broken_wrapper"),
+        "CRLF no shebang deve virar evidência: {json_out}"
+    );
+    assert!(
+        value["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["cause_id"] == "cc_broken_wrapper")
+    );
+    assert!(value["profile"]["wrapper_chain"].as_array().map_or(false, |c| !c.is_empty()));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn ld_preload_injetado_aparece_como_evidencia_info() {
+    let out = Command::new(BIN)
+        .args(["diagnose", "--json", "/bin/true"])
+        .env("LD_PRELOAD", "/tmp/idwhy_hook_fake.so")
+        .output()
+        .expect("binário de teste deve executar");
+    assert_eq!(out.status.code(), Some(0));
+
+    let value: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    let evidences = value["evidences"].as_array().unwrap();
+    let preload = evidences
+        .iter()
+        .find(|e| e["kind"] == "ld_preload_active")
+        .expect("LD_PRELOAD setado deve gerar evidência");
+    assert_eq!(preload["severity"], "Info");
+    assert_eq!(
+        preload["data"]["value"].as_str(),
+        Some("/tmp/idwhy_hook_fake.so")
+    );
+
+    let causes = value["candidates"].as_array().unwrap();
+    assert!(causes.iter().any(|c| c["cause_id"] == "cc_suspicious_ld_env"));
+}
+
+#[test]
 fn diagnostica_binario_real_em_texto() {
     let (code, stdout, _stderr) = run_diag(&["diagnose", "/bin/true"]);
     assert_eq!(code, 0);

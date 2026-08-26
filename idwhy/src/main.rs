@@ -5,6 +5,7 @@ mod report;
 
 use clap::{Parser, Subcommand};
 use std::io::{self, IsTerminal, Write};
+use std::path::Path;
 
 use crate::core::types::{ApplicationProfile, DiagnosticReport};
 
@@ -47,40 +48,58 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn run_diagnosis(target: &str) -> anyhow::Result<DiagnosticReport> {
-    let resolved = core::discovery::resolve_executable(target);
+    let resolved = core::discovery::resolve_target(target);
 
-    let (resolved_executable, binary, dependency_graph, permissions) = match resolved {
-        Ok(path) => {
-            let binary = analyzers::static_analyzer::analyze_binary(&path).ok();
+    let (resolved_executable, wrapper_chain, binary, dependency_graph, permissions) =
+        match resolved {
+            Ok(target) => {
+                let path = target.final_executable;
+                let binary = analyzers::static_analyzer::analyze_binary(&path).ok();
 
-            let dependency_graph = match &binary {
-                Some(b) if b.elf_valid => {
-                    analyzers::dependency_analyzer::build_dependency_graph(b, &path)
-                }
-                _ => Default::default(),
-            };
+                let dependency_graph = match &binary {
+                    Some(b) if b.elf_valid => {
+                        analyzers::dependency_analyzer::build_dependency_graph(b, &path)
+                    }
+                    _ => Default::default(),
+                };
 
-            let permissions =
-                analyzers::permission_analyzer::analyze_permissions(&path);
+                let permissions =
+                    analyzers::permission_analyzer::analyze_permissions(&path);
 
-            (
-                path.to_string_lossy().to_string(),
-                binary,
-                dependency_graph,
-                permissions,
-            )
-        }
-        Err(_) => (target.to_string(), None, Default::default(), None),
-    };
+                (
+                    path.to_string_lossy().to_string(),
+                    target.chain,
+                    binary,
+                    dependency_graph,
+                    permissions,
+                )
+            }
+            Err(_) => (target.to_string(), Vec::new(), None, Default::default(), None),
+        };
 
-    let profile = ApplicationProfile {
+    let mut profile = ApplicationProfile {
         input_path: target.to_string(),
-        resolved_executable,
+        resolved_executable: resolved_executable.clone(),
+        wrapper_chain,
         binary,
         dependency_graph,
         permissions,
+        environment: None,
+        package_owner: None,
+        integrity: None,
     };
 
+    profile.environment = Some(analyzers::environment_analyzer::scan(&profile));
+    profile.package_owner =
+        analyzers::package_analyzer::find_owner(Path::new(&resolved_executable));
+
+    if let (Some(owner), Some(binary)) = (&profile.package_owner, &profile.binary) {
+        profile.integrity = analyzers::package_analyzer::verify_integrity(
+            Path::new(&resolved_executable),
+            &owner.name,
+            &binary.sha256,
+        );
+    }
     let evidences = inference::rule_engine::collect_evidence(&profile);
     let candidates = inference::rule_engine::rank_causes(&profile, &evidences);
 
