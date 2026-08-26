@@ -109,6 +109,7 @@ mod tests {
             environment: None,
             package_owner: None,
             integrity: None,
+            runtime: None,
             wrapper_chain: Vec::new(),
         }
     }

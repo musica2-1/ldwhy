@@ -27,30 +27,52 @@ enum Commands {
         /// Emitir relatório em JSON em vez de texto formatado
         #[arg(long)]
         json: bool,
+        /// Autoriza execução controlada do alvo sob sandbox + strace
+        #[arg(long)]
+        allow_exec: bool,
+        /// Segundo sinal consciente para executar SEM sandbox disponível
+        #[arg(long, requires = "allow_exec")]
+        unsafe_no_sandbox: bool,
+        /// Timeout da execução controlada (segundos)
+        #[arg(long, default_value_t = 10)]
+        exec_timeout: u64,
     },
+    /// Mostra a postura de segurança da máquina (sandbox, políticas)
+    SecurityCheck,
 }
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Commands::Diagnose { target, json }) => {
-            run_and_print(&target, json)?;
+        Some(Commands::Diagnose { target, json, allow_exec, unsafe_no_sandbox, exec_timeout }) => {
+            let exec = if allow_exec {
+                Some((unsafe_no_sandbox, exec_timeout))
+            } else {
+                None
+            };
+            run_and_print(&target, json, exec)?;
+        }
+        Some(Commands::SecurityCheck) => {
+            print_security_check();
         }
         None => {
             let target = select_target_interactively()?;
             println!();
-            run_and_print(&target, false)?;
+            run_and_print(&target, false, None)?;
         }
     }
 
     Ok(())
 }
 
-fn run_diagnosis(target: &str) -> anyhow::Result<DiagnosticReport> {
+fn run_diagnosis(
+    target: &str,
+    exec: Option<(bool, u64)>,
+) -> anyhow::Result<DiagnosticReport> {
     let resolved = core::discovery::resolve_target(target);
 
-    let (resolved_executable, wrapper_chain, binary, dependency_graph, permissions) =
+    let (resolved_executable, wrapper_chain, runtime_exec_args, binary, dependency_graph, permissions) =
         match resolved {
             Ok(target) => {
                 let path = target.final_executable;
@@ -69,12 +91,13 @@ fn run_diagnosis(target: &str) -> anyhow::Result<DiagnosticReport> {
                 (
                     path.to_string_lossy().to_string(),
                     target.chain,
+                    target.exec_args,
                     binary,
                     dependency_graph,
                     permissions,
                 )
             }
-            Err(_) => (target.to_string(), Vec::new(), None, Default::default(), None),
+            Err(_) => (target.to_string(), Vec::new(), Vec::new(), None, Default::default(), None),
         };
 
     let mut profile = ApplicationProfile {
@@ -87,6 +110,7 @@ fn run_diagnosis(target: &str) -> anyhow::Result<DiagnosticReport> {
         environment: None,
         package_owner: None,
         integrity: None,
+        runtime: None,
     };
 
     profile.environment = Some(analyzers::environment_analyzer::scan(&profile));
@@ -100,6 +124,31 @@ fn run_diagnosis(target: &str) -> anyhow::Result<DiagnosticReport> {
             &binary.sha256,
         );
     }
+
+    if let Some((unsafe_override, timeout_secs)) = exec {
+        let policy = core::security::ExecutionPolicy {
+            allow_execution: true,
+            unsafe_no_sandbox_override: unsafe_override,
+            ..Default::default()
+        };
+        let probe = core::security::probe_sandbox();
+        policy.validate(&probe).map_err(|e| anyhow::anyhow!("execução recusada: {e}"))?;
+
+        let strace_path = core::security::probe_strace()
+            .ok_or_else(|| anyhow::anyhow!("strace não encontrado (dnf install strace)"))?;
+
+        profile.runtime = Some(
+            analyzers::runtime_analyzer::run_controlled(
+                Path::new(&resolved_executable),
+                &runtime_exec_args,
+                &policy,
+                &probe,
+                &strace_path,
+                std::time::Duration::from_secs(timeout_secs),
+            )?
+            .result,
+        );
+    }
     let evidences = inference::rule_engine::collect_evidence(&profile);
     let candidates = inference::rule_engine::rank_causes(&profile, &evidences);
 
@@ -110,14 +159,49 @@ fn run_diagnosis(target: &str) -> anyhow::Result<DiagnosticReport> {
     })
 }
 
-fn run_and_print(target: &str, json: bool) -> anyhow::Result<()> {
-    let report = run_diagnosis(target)?;
+fn run_and_print(
+    target: &str,
+    json: bool,
+    exec: Option<(bool, u64)>,
+) -> anyhow::Result<()> {
+    let report = run_diagnosis(target, exec)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         report::formatter::print_report(&report);
     }
     Ok(())
+}
+
+fn print_security_check() {
+    let probe = core::security::probe_sandbox();
+    let policy = core::security::ExecutionPolicy::default();
+
+    println!("{DLINE}");
+    println!("  idwhy — postura de segurança");
+    println!("{DLINE}\n");
+
+    println!("  Execução do alvo diagnosticado: DESLIGADA por padrão");
+    println!("  Leitura de arquivos: handle único com fstat (anti-TOCTOU)");
+    println!("  Comandos externos: fixos e somente leitura, args via Command::arg\n");
+
+    println!("  Sandbox:");
+    match (&probe.bwrap_path, &probe.bwrap_version) {
+        (Some(p), Some(v)) => println!("    [✓] bubblewrap — {p} ({v})"),
+        (Some(p), None) => println!("    [✓] bubblewrap — {p}"),
+        (None, _) => println!("    [✗] bubblewrap não encontrado (dnf install bubblewrap)"),
+    }
+    match &probe.systemd_run_path {
+        Some(p) => println!("    [~] systemd-run presente ({p}) — suporte ainda não integrado"),
+        None => println!("    [ ] systemd-run não encontrado"),
+    }
+
+    println!("\n  Política de execução controlada (Etapa 8):");
+    match policy.validate(&probe) {
+        Ok(()) => println!("    Pronta: sandbox disponível para a execução controlada."),
+        Err(reason) => println!("    Bloqueada: {reason}"),
+    }
+    println!("\n{DLINE}");
 }
 
 /// Modo interativo: lista os aplicativos em execução (serviços de sistema

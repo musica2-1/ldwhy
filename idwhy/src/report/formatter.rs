@@ -90,10 +90,41 @@ pub fn print_report(report: &DiagnosticReport) {
         }
     }
 
+    if let Some(rt) = &report.profile.runtime {
+        println!("\n{LINE}");
+        println!("RUNTIME (sandbox: {})", if rt.ran_in_sandbox { "bubblewrap" } else { "sem sandbox!" });
+        println!("{LINE}");
+        let fim = match (rt.exit_code, rt.killed_by_timeout) {
+            (_, true) => format!("morto por timeout após {} ms", rt.duration_ms),
+            (Some(0), _) => format!("saiu limpo em {} ms", rt.duration_ms),
+            (Some(c), _) => format!("exit {c} em {} ms", rt.duration_ms),
+            (None, _) => "finalizado sem código de saída".into(),
+        };
+        println!("  Resultado:  {fim}");
+
+        let relevantes: Vec<_> = rt
+            .failed_syscalls
+            .iter()
+            .filter(|f| {
+                crate::analyzers::runtime_analyzer::severity_for_failure(f).is_some()
+            })
+            .collect();
+        if relevantes.is_empty() {
+            println!("  Falhas relevantes: (nenhuma — probes ENOENT normais foram filtrados)");
+        } else {
+            println!("  Falhas relevantes:");
+            for f in relevantes.iter().take(10) {
+                println!("    [{}] {} {} → {} ({})", f.errno, f.call, f.path, f.errno, f.errno_desc);
+            }
+            if relevantes.len() > 10 {
+                println!("    … e mais {}", relevantes.len() - 10);
+            }
+        }
+    }
+
     println!("\n{LINE}");
     println!("EVIDENCE");
-    println!("{LINE}");
-    if report.evidences.is_empty() {
+    println!("{LINE}");    if report.evidences.is_empty() {
         println!("  (nenhuma evidência coletada)");
     }
     for ev in &report.evidences {

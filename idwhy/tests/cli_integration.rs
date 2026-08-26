@@ -41,7 +41,7 @@ fn script_com_shebang_crlf_gera_evidencia_de_wrapper_quebrado() {
             .iter()
             .any(|c| c["cause_id"] == "cc_broken_wrapper")
     );
-    assert!(value["profile"]["wrapper_chain"].as_array().map_or(false, |c| !c.is_empty()));
+    assert!(value["profile"]["wrapper_chain"].as_array().is_some_and(|c| !c.is_empty()));
 
     let _ = std::fs::remove_dir_all(&dir);
 }

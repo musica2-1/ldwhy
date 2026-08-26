@@ -6,9 +6,12 @@ use std::path::{Path, PathBuf};
 const MAX_WRAPPER_DEPTH: usize = 5;
 
 /// Um alvo resolvido: o executável final + os wrappers atravessados.
+/// `exec_args` reproduz o argv que o kernel montaria — sem ele, rodar
+/// o interpretador final sem o script deixa o processo esperando stdin.
 #[derive(Debug, Clone)]
 pub struct ResolvedTarget {
     pub final_executable: PathBuf,
+    pub exec_args: Vec<String>,
     pub chain: Vec<WrapperStep>,
 }
 
@@ -140,6 +143,10 @@ pub fn resolve_target(input: &str) -> anyhow::Result<ResolvedTarget> {
     let mut current = basic_resolve(input)?;
     let mut chain = Vec::new();
     let mut visited: Vec<PathBuf> = vec![current.clone()];
+    // Argumentos que o kernel passaria ao executável final (flags do
+    // shebang) + o script original consumido pelo último salto.
+    let mut exec_flags: Vec<String> = Vec::new();
+    let mut script_consumed: Option<PathBuf> = None;
 
     for _ in 0..MAX_WRAPPER_DEPTH {
         match classify(&current) {
@@ -185,7 +192,10 @@ pub fn resolve_target(input: &str) -> anyhow::Result<ResolvedTarget> {
                 let is_env = shebang.interpreter == "/usr/bin/env"
                     || shebang.interpreter.ends_with("/env");
                 let next = if is_env {
-                    let Some(target) = shebang.arg.as_deref() else {
+                    // env recebe UM argumento ("python3 mod.py") e reparte
+                    // ele mesmo; reproduzimos: 1º token vira o comando,
+                    // restantes são pass-through.
+                    let Some(arg) = shebang.arg.as_deref() else {
                         chain.push(WrapperStep {
                             kind: "script_shebang".into(),
                             detail: "#!/usr/bin/env sem comando".into(),
@@ -194,8 +204,22 @@ pub fn resolve_target(input: &str) -> anyhow::Result<ResolvedTarget> {
                         });
                         break;
                     };
-                    basic_resolve(target)?
+                    let mut tokens = arg.split_whitespace();
+                    let Some(command) = tokens.next() else {
+                        chain.push(WrapperStep {
+                            kind: "script_shebang".into(),
+                            detail: "#!/usr/bin/env sem comando".into(),
+                            points_to: current.to_string_lossy().into_owned(),
+                            issue: Some("env sem comando a resolver".into()),
+                        });
+                        break;
+                    };
+                    exec_flags.extend(tokens.map(String::from));
+                    basic_resolve(command)?
                 } else if Path::new(&shebang.interpreter).is_file() {
+                    if let Some(extra) = &shebang.arg {
+                        exec_flags.push(extra.clone());
+                    }
                     Path::new(&shebang.interpreter).canonicalize()?
                 } else {
                     anyhow::bail!(
@@ -223,12 +247,19 @@ pub fn resolve_target(input: &str) -> anyhow::Result<ResolvedTarget> {
                     anyhow::bail!("loop de wrappers detectado em {:?}", next);
                 }
                 visited.push(next.clone());
+                // Este 'current' é o script que o próximo executável consome.
+                script_consumed = Some(current.clone());
                 current = next;
             }
         }
     }
 
-    Ok(ResolvedTarget { final_executable: current, chain })
+    let mut exec_args = exec_flags;
+    if let Some(script) = script_consumed {
+        exec_args.push(script.to_string_lossy().into_owned());
+    }
+
+    Ok(ResolvedTarget { final_executable: current, exec_args, chain })
 }
 
 fn wrapper_kind_for(resolved: &Path) -> String {
@@ -273,12 +304,34 @@ mod tests {
         assert_eq!(target.chain.len(), 1);
         assert_eq!(target.chain[0].kind, "script_shebang");
         // /bin/sh costuma ser symlink (→ bash); canonicalize revela o real.
+        let final_path = target.final_executable.to_string_lossy();
         assert!(
-            target.final_executable.to_string_lossy().ends_with("/bash")
-                || target.final_executable.to_string_lossy().ends_with("/sh"),
-            "veio {:?}",
-            target.final_executable
+            final_path.ends_with("/bash") || final_path.ends_with("/sh"),
+            "veio {final_path}"
         );
+        // argv do kernel: o script é argumento do interpretador.
+        assert_eq!(target.exec_args, vec![script.to_string_lossy().into_owned()]);
+    }
+
+    #[test]
+    fn env_com_argumento_extra_vira_pass_through() {
+        let dir = tempdir("envpass");
+        if basic_resolve("python3").is_err() {
+            return;
+        }
+        let script =
+            write_file(&dir, "tool.py", b"#!/usr/bin/env python3 -u\nprint('oi')\n");
+        let target = resolve_target(script.to_str().unwrap()).unwrap();
+        assert!(target.final_executable.to_string_lossy().contains("python"));
+        assert_eq!(target.exec_args, vec!["-u".to_string(), script.to_string_lossy().into_owned()]);
+    }
+
+    #[test]
+    fn binario_direto_nao_tem_args() {
+        let target = resolve_target("/bin/true").unwrap();
+        assert!(target.chain.is_empty());
+        assert!(target.exec_args.is_empty());
+        assert!(target.final_executable.ends_with("true"));
     }
 
     #[test]

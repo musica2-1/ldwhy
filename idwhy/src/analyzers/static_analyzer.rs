@@ -1,11 +1,12 @@
+use crate::core::security;
 use crate::core::types::BinaryInfo;
 use goblin::elf::Elf;
 use sha2::{Digest, Sha256};
-use std::fs;
 use std::path::Path;
 
 pub fn analyze_binary(path: &Path) -> anyhow::Result<BinaryInfo> {
-    let buffer = fs::read(path)?;
+    // Leitura anti-TOCTOU: handle único verificado por fstat (§5 do README).
+    let buffer = security::read_file_verified(path)?;
 
     // Hash SHA-256 sempre calculado — usado depois para checar integridade
     // contra o package manager, e é seguro pois nunca executamos o binário.

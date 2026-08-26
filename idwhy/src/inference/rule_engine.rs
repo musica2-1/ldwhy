@@ -24,6 +24,9 @@ const CALIBRATIONS: &[(&str, Calibration)] = &[
     ("environment", Calibration { score_full: 40.0, cap: 0.60 }),
     // Sem bit x aplicável ao usuário é inequívoco (o próprio kernel negaria).
     ("permission", Calibration { score_full: 40.0, cap: 0.95 }),
+    // Runtime sob sandbox: ENOENT em .so é forte, mas apps fazem probes
+    // legítimos — teto menor que categorias inequívocas.
+    ("runtime", Calibration { score_full: 50.0, cap: 0.85 }),
 ];
 
 fn calibration_for(category: &str) -> Option<&'static Calibration> {
@@ -99,6 +102,63 @@ pub fn collect_evidence(profile: &ApplicationProfile) -> Vec<Evidence> {
                     "file_gid": perm.file_gid,
                     "euid": perm.euid,
                 }),
+            });
+        }
+    }
+
+    // Execução controlada (Etapa 8): falhas de syscall sob sandbox.
+    if let Some(rt) = &profile.runtime {
+        for f in &rt.failed_syscalls {
+            if let Some((severity, weight)) =
+                crate::analyzers::runtime_analyzer::severity_for_failure(f)
+            {
+                let kind = match f.errno.as_str() {
+                    "ENOENT" => "runtime_missing_library",
+                    "EACCES" | "EPERM" => "runtime_permission_denied",
+                    _ => "runtime_path_issue",
+                };
+                evidences.push(Evidence {
+                    id: next_id(),
+                    source: "runtime_analyzer".into(),
+                    kind: kind.into(),
+                    severity,
+                    weight,
+                    description: format!(
+                        "{} em '{}' retornou {} ({}) durante execução sandboxada",
+                        f.call, f.path, f.errno, f.errno_desc
+                    ),
+                    data: serde_json::json!({
+                        "call": f.call, "path": f.path, "errno": f.errno,
+                    }),
+                });
+            }
+        }
+
+        if rt.killed_by_timeout {
+            evidences.push(Evidence {
+                id: next_id(),
+                source: "runtime_analyzer".into(),
+                kind: "runtime_timeout".into(),
+                severity: Severity::Info,
+                weight: 5,
+                description: format!(
+                    "Processo excedeu o timeout ({} ms) e foi encerrado",
+                    rt.duration_ms
+                ),
+                data: serde_json::json!({ "duration_ms": rt.duration_ms }),
+            });
+        } else if rt.exit_code == Some(0) {
+            evidences.push(Evidence {
+                id: next_id(),
+                source: "runtime_analyzer".into(),
+                kind: "runtime_clean_exit".into(),
+                severity: Severity::Info,
+                weight: 0,
+                description: format!(
+                    "Executou sob sandbox e saiu limpo ({} ms)",
+                    rt.duration_ms
+                ),
+                data: serde_json::json!({ "duration_ms": rt.duration_ms }),
             });
         }
     }
@@ -535,6 +595,39 @@ pub fn rank_causes(profile: &ApplicationProfile, evidences: &[Evidence]) -> Vec<
         });
     }
 
+    let runtime_lib_evs: Vec<&Evidence> = evidences
+        .iter()
+        .filter(|e| e.kind == "runtime_missing_library")
+        .collect();
+    if !runtime_lib_evs.is_empty() {
+        let score: f64 = runtime_lib_evs.iter().map(|e| e.weight as f64).sum();
+        let paths: Vec<String> = runtime_lib_evs
+            .iter()
+            .filter_map(|e| e.data.get("path").and_then(|v| v.as_str()).map(String::from))
+            .collect();
+        candidates.push(CauseCandidate {
+            cause_id: "cc_runtime_dependency_miss".into(),
+            description: format!(
+                "Falha ao carregar biblioteca(s) em runtime (sandbox): {}",
+                paths.join(", ")
+            ),
+            category: "runtime".into(),
+            evidence_ids: runtime_lib_evs.iter().map(|e| e.id.clone()).collect(),
+            score,
+            confidence: calibrated_confidence("runtime", score),
+            suggested_fix: Some(Remediation {
+                description: "Biblioteca requerida em execução não foi encontrada pelo loader".into(),
+                investigation_command: Some(format!(
+                    "ldd {} # confirme o que falta carregar",
+                    profile.resolved_executable
+                )),
+                suggested_command: None,
+                risk: "low".into(),
+                automated_safe: false,
+            }),
+        });
+    }
+
     // Sem nenhuma evidência crítica -> nada encontrado nesta camada estática
     if candidates.is_empty() {
         candidates.push(CauseCandidate {
@@ -594,6 +687,7 @@ mod tests {
             environment: None,
             package_owner: None,
             integrity: None,
+            runtime: None,
             wrapper_chain: Vec::new(),
         }
     }

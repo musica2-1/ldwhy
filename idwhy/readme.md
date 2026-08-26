@@ -118,7 +118,9 @@ Duas funções:
 - `collect_evidence()`: converte o `ApplicationProfile` em uma lista de
   `Evidence` tipada (hoje: `path_not_found`, `elf_invalid`,
   `missing_shared_library`, `no_interpreter`, `exec_permission_denied`,
-  `missing_display_env`, `ld_preload_active`, `ld_library_path_active`).
+  `missing_display_env`, `ld_preload_active`, `ld_library_path_active`,
+  `broken_wrapper`, `binary_modified_from_package`, `runtime_missing_library`,
+  `runtime_permission_denied`, `runtime_timeout`, `runtime_clean_exit`).
 - `rank_causes()`: agrupa evidências relacionadas em `CauseCandidate`
   (score derivado da soma dos pesos das evidências — sem pesos
   duplicados em hardcode), calcula uma `confidence` (heurística — ver
@@ -193,6 +195,30 @@ Semântica honesta em três estados no JSON (`integrity.matches`):
 reinstalação concreta · `null` não comparável (algoritmo diferente, ex:
 rpm legado com md5) — **nunca vira alerta**.
 
+### 2.10 Execução controlada (`src/analyzers/runtime_analyzer.rs`)
+
+Opt-in explícito: `idwhy diagnose --allow-exec <alvo>`. **Sem essa flag
+nada é executado, nunca.**
+
+Fluxo: `ExecutionPolicy::validate()` → bwrap (args fixos da seção 5) →
+`strace -f -q -e trace=%file -- <alvo>` → parser de falhas.
+
+- `%file` captura só syscalls de arquivo (open*/stat*/access*/exec*) —
+  exatamente o que diagnostica "não achou lib em runtime", sem ruído.
+- **Timeout** (`--exec-timeout`, padrão 10s) mata o processo; captura de
+  stdout/stderr em threads com teto de 1 MiB cada (evita deadlock de
+  pipe); ambiente zerado (`--clearenv`) com PATH mínimo.
+- **Classificação anti-falso-positivo**: ENOENT em `*.so*` carregável vira
+  evidência Warning (`runtime_missing_library` → causa
+  `cc_runtime_dependency_miss`, cap 0.85); outros ENOENT são probes
+  normais de app e são descartados; EACCES/EPERM viram Error.
+- Saída limpa vira evidência Info informativa; timeout idem.
+- O texto bruto do strace fica preservado no `RunOutcome` para a
+  correlação temporal da Etapa 9 (journalctl por PID/janela).
+
+Requisitos na máquina: `bubblewrap` e `strace` instalados (o tool recusa
+com dica de instalação caso falte qualquer um).
+
 ---
 
 ## 3. O que NÃO está implementado ainda
@@ -207,7 +233,7 @@ arriscado):
 | ~~3~~ | ~~Package ID~~ | **Implementado (seção 2.8)** — dnf/rpm e apt/dpkg; pacman ficou para depois | Média |
 | ~~4~~ | ~~File Integrity~~ | **Implementado (seção 2.9)** — rpm via FILEDIGESTS; debian via md5sums+md5sum | Média |
 | ~~5~~ | ~~Script/wrapper detection~~ | **Implementado (seção 2.1)** — shebang/env/AppImage; AppImage para no wrapper (payload só existe montado) | Média |
-| 6 | **Controlled Execution (strace)** | Executar o app com `strace` filtrado dentro de sandbox (`bubblewrap`) e capturar exit code + syscalls com erro | Alta — mexe com execução real, precisa do modelo de segurança da seção J |
+| ~~6~~ | ~~Controlled Execution~~ | **Implementado (seção 2.10)** — opt-in explícito `--allow-exec`, sempre sob bwrap da seção 5 | Alta |
 | 7 | **Log Collection (journalctl)** | Buscar logs por PID/tempo depois da execução controlada | Alta (depende do item 6 para ter PID/tempo) |
 | 8 | **Evidence Correlation temporal/espacial** | Algoritmo de agrupamento por janela de tempo — só faz sentido quando existir mais de uma fonte com timestamp (strace + journal + coredump) | Alta |
 | 9 | **Flatpak/sandbox analyzer** | `flatpak info`, overrides de permissão | Média |
@@ -247,25 +273,28 @@ enquanto esse histórico não existe.
 
 ---
 
-## 5. Modelo de segurança (o que já é respeitado, o que falta)
+## 5. Modelo de segurança (implementado em `src/core/security.rs`)
 
 Já implementado:
-- Nunca executa o binário sendo diagnosticado (só lê ELF com `goblin`).
-- Chamadas externas são somente leitura e fixas (nunca montadas por
-  concatenação): `ldconfig -p`, `rpm -qf`, `dpkg -S` e
-  `dnf --cacheonly provides` e `md5sum <arquivo>` (sem acesso à rede;
-todos com argumentos fixos, nunca concatenação).
+- **Nunca executa o binário diagnosticado** na análise estática.
+- Chamadas externas somente leitura e fixas: `ldconfig -p`, `rpm -qf`,
+  `dpkg -S`, `dnf --cacheonly provides`, `md5sum <arquivo>` — sem rede,
+  sempre `Command::arg(...)`, nunca concatenação de string.
+- **Leitura anti-TOCTOU** (`read_file_verified`): abre um único handle
+  com `O_NONBLOCK`, valida via fstat que é arquivo regular ANTES de
+  consumir e lê só desse handle — FIFOs são rejeitados sem travar a
+  ferramenta; teto de 2 GiB contra OOM.
+- **Probe de sandbox**: `idwhy security-check` mostra bwrap/systemd-run
+  disponíveis e o estado da política.
+- **ExecutionPolicy**: execução do alvo OFF por padrão; sandbox ausente
+  só passa com override duplo consciente (`--unsafe-no-sandbox`).
+- **Builder do bubblewrap** (consumido pela execução controlada): args
+  fixos e testáveis — `--ro-bind / / --dev /dev --proc /proc --tmpfs
+  /tmp --unshare-all --die-with-parent --new-session --clearenv` + alvo
+  como argumento.
 
-Falta implementar antes de adicionar `strace`/execução controlada
-(componente 6 da tabela acima):
-- Sandbox via `bubblewrap` (`bwrap --ro-bind / / --unshare-all ...`) ou
-  `systemd-run --property=ProtectSystem=strict`.
-- Validação de path com `realpath()` + `stat()` antes de qualquer
-  operação (TOCTOU protection).
-- Nunca montar comandos por concatenação de string — sempre
-  `Command::new(...).arg(...)` (já seguido no código atual).
-
----
+A execução controlada (seção 2.10) consome exatamente este módulo:
+builder do bwrap + validação de política antes de qualquer spawn.
 
 ## 6. Como estender
 
@@ -299,13 +328,15 @@ src/
 ├── core/
 │   ├── types.rs                   # Evidence, CauseCandidate, ApplicationProfile
 │   ├── discovery.rs               # Resolve nome/path -> executável real
-│   └── process_scan.rs            # Lista aplicações em execução via /proc/*/exe
+│   ├── process_scan.rs            # Lista aplicações em execução via /proc/*/exe
+│   └── security.rs                # Anti-TOCTOU, probe de sandbox, ExecutionPolicy
 ├── analyzers/
 │   ├── static_analyzer.rs         # Parsing ELF (goblin), nunca executa o binário
 │   ├── dependency_analyzer.rs     # Grafo de dependências (BFS por objeto + ldconfig)
 │   ├── permission_analyzer.rs     # Simula decisão do kernel sobre execução
 │   ├── environment_analyzer.rs    # Display/LD_* correlacionado com libs gráficas
-│   └── package_analyzer.rs        # Dono/fornecedor de arquivos via rpm/dpkg/dnf
+│   ├── package_analyzer.rs        # Dono/fornecedor de arquivos via rpm/dpkg/dnf
+│   └── runtime_analyzer.rs        # Execução sandboxada + parser de strace
 ├── inference/
 │   └── rule_engine.rs             # Evidence -> CauseCandidate, scoring
 └── report/

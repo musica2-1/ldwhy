@@ -49,6 +49,16 @@ pub struct ApplicationProfile {
     pub package_owner: Option<crate::analyzers::package_analyzer::PackageInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub integrity: Option<crate::analyzers::package_analyzer::IntegrityCheck>,
+    /// Presente apenas quando a execução controlada foi autorizada.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeResult>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct DiagnosticReport {
+    pub profile: ApplicationProfile,
+    pub evidences: Vec<Evidence>,
+    pub candidates: Vec<CauseCandidate>,
 }
 
 #[derive(Debug, Serialize, Clone, PartialEq, Eq, Hash)]
@@ -92,8 +102,19 @@ pub struct Remediation {
 }
 
 #[derive(Debug, Serialize, Clone)]
-pub struct DiagnosticReport {
-    pub profile: ApplicationProfile,
-    pub evidences: Vec<Evidence>,
-    pub candidates: Vec<CauseCandidate>,
+pub struct FailedSyscall {
+    pub call: String,
+    pub path: String,
+    pub errno: String,
+    pub errno_desc: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct RuntimeResult {
+    /// Execução ocorreu dentro do bubblewrap?
+    pub ran_in_sandbox: bool,
+    pub exit_code: Option<i32>,
+    pub killed_by_timeout: bool,
+    pub duration_ms: u64,
+    pub failed_syscalls: Vec<FailedSyscall>,
 }
