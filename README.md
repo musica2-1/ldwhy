@@ -1,4 +1,4 @@
-##idwhy
+#idwhy
 
 *idwhy* — motor de diagnóstico causal para aplicações
 Linux. Em vez de despejar logs brutos (como `strace` ou `journalctl` fazem),
