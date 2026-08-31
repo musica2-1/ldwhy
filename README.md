@@ -1,8 +1,8 @@
 # idwhy
 
-*Linux Application Diagnostic* — motor de diagnóstico causal para aplicações
+*idwhy* — motor de diagnóstico causal para aplicações
 Linux. Em vez de despejar logs brutos (como `strace` ou `journalctl` fazem),
-a ferramenta correlaciona evidências de múltiplas camadas do sistema e
+essa ferramenta correlaciona as evidências de múltiplas camadas do sistema e
 produz um diagnóstico com **causa raiz ranqueada + nível de confiança**.
 
 Este README documenta a lógica de funcionamento do que já está implementado
